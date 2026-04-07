@@ -1,0 +1,611 @@
+---
+title: "Notes sur l'inégalité des chances avec Wasserstein"
+format:
+  html:
+    embed-resources: true
+knitr: 
+  opts_chunk: 
+    echo: false
+    warning: false
+    message: false
+output: html_notebook
+---
+
+Contrairement aux indices classiques comme le coefficient de Gini, qui mesure la concentration interne, ou le test de Student, qui compare des moyennes, la distance de Wasserstein (issue de la théorie du transport optimal) offre une mesure géométrique de la divergence entre deux distributions. C'est le coût minimal de transport pour transformer une distribution en l'autre. Dans sa version simple, à une dimension, elle consiste à comparer les distributions quantile par quantile et à mesurer à chaque fois l'écart pour égaliser les valeurs au sein de ce quantile, puis de faire la moyenne sur tous les quantiles.
+
+En comparant les distributions des log-salaires des individus selon leur origine sociale (enfants d'ouvriers versus enfants de cadres), l'indice de Wasserstein quantifie l'effort global — le "coût de transport" — nécessaire pour passer d'une distribution à l'autre. En utilisant le log-salaire, on mesure des écarts relatifs (pourcentages). Une distance de $0,30$ sur les logs signifie qu'en moyenne, il existe un écart de 30 points de log entre les deux groupes. Cet écart correspond à un ratio de $e^{0,30} \approx 1,35$. Cela signifie que pour "transporter" un enfant d'ouvrier au niveau d'un enfant de cadre, il faudrait augmenter son salaire de 35 % en moyenne, et ce, à chaque échelon de la distribution (du plus pauvre au plus riche des enfants d'ouvrier).
+
+```{r}
+# Source
+library(tidyverse)
+library(transport)
+library(WRS2)
+library(boot)
+library(viridis)
+
+EE <- arrow::read_parquet("EE82_23.parquet")
+indice_prix <- read.csv2("serie_011813530_03032026/valeurs_annuelles.csv", skip = 3) |> 
+    as_tibble() |> 
+    transmute(ANNEE = Période, ipc = as.numeric(X))
+
+EE <- EE |> 
+    filter(between(AG, 30, 60), gen5 >= "(1940,1945]") |> 
+    mutate(AG5 = cut(AG, breaks = c(30, 35, 40, 45, 50, 55, 60), include.lowest = TRUE, ordered = TRUE),
+           AG10 = cut(AG, breaks = c(30, 40, 50, 60), include.lowest = TRUE, ordered = TRUE),
+           id = 1:n())
+
+EE <- EE |> 
+    filter(ANNEE >= 1990, SAL > 0) |> 
+    drop_na(SAL) |> 
+    left_join(indice_prix, by = "ANNEE") |> 
+    mutate(sal2025 = SAL * ipc / 100,
+           logsal = log(sal2025),
+           AN11  = cut(ANNEE, breaks = seq(1990, 2023, 11), include.lowest = TRUE, 
+                       labels = c("90-00", "01-11", "12-23"), ordered = TRUE),
+           GEN = (as.integer(AN11) - as.integer(AG10)) * 10 + 1960,
+           GEN = factor(GEN))
+
+
+csp_origin <- levels(EE$CSPP1)[-7] 
+names(csp_origin) <- c("Agriculteur", "ACCE", "Cadre", "Pinter", "Employé", "Ouvrier")
+
+EE <- EE |> 
+    filter(CSPP1 != "Inactifs (n'ayant jamais travaillé)") |> 
+    mutate(Origin = CSPP1 |> fct_recode(!!!csp_origin))
+
+# ON FAIT AVEC diplome7
+dip_levels <- EE$diplome7 |> levels()
+names(dip_levels) <- c(paste0("Niveau", 6:0), "Non réponse")
+EE <- EE |> 
+    mutate(dip7 = fct_recode(diplome7, !!!dip_levels))
+
+```
+
+```{r}
+# Calcul de W2 selon l'origine
+EE_nested <- EE |> 
+    nest(data = -c(SEXE, AN11, AG10))
+
+wass_boot <- function(data, indices, ori, var = "logsal") {
+    d <- data[indices, ]
+    x <- d |> filter(Origin == ori) |> pull(.data[[var]])
+    y <- d |> filter(Origin == "Ouvrier") |> pull(.data[[var]])
+    if (length(x) < 2 | length(y) < 2) return(NA)
+    wasserstein1d(x, y, p = 2)
+}
+
+wass_fct <- function(df_list, var = "logsal", R = 100) {
+    
+    les_estimations <- reduce(c("Agriculteur", "ACCE", "Cadre", "Pinter", "Employé"), \(df, ori) {
+        df |> mutate(
+            "w_{ori}"  := map_dbl(df_list, \(x) wasserstein1d(
+                a = x |> filter(Origin == ori) |> pull(.data[[var]]), 
+                b = x |> filter(Origin == "Ouvrier") |> pull(.data[[var]]), p = 2)),
+            "m_{ori}"  := map_dbl(df_list, \(x) mean(x[[var]][x$Origin == ori], na.rm = TRUE)),
+            "sd_{ori}" := map_dbl(df_list, \(x) sd(x[[var]][x$Origin == ori], na.rm = TRUE))
+        )
+    }, .init = tibble(data = df_list)) |> 
+        mutate(
+            m_Ouvrier  = map_dbl(df_list, \(x) mean(x[[var]][x$Origin == "Ouvrier"], na.rm = TRUE)),
+            sd_Ouvrier = map_dbl(df_list, \(x) sd(x[[var]][x$Origin == "Ouvrier"],  na.rm = TRUE))
+        )
+    
+    les_boots <- reduce(c("Agriculteur", "ACCE", "Cadre", "Pinter", "Employé"), \(df, ori) {
+        df |> mutate(
+            "boot_{ori}" := map(df_list, \(x) boot(
+                data = x, 
+                statistic = \(d, i) wass_boot(d, i, ori = ori, var = var), 
+                R = R
+            ))
+        )
+    }, .init = tibble(data = df_list))
+    
+    les_ic <- les_boots |> 
+        transmute(across(
+            .cols = starts_with("boot_"), 
+            .fns  = \(x) map(x, \(y) boot.ci(y, type = "perc")$percent[4:5]),
+            .names = "{.col}_ci"
+        )) |> 
+        unnest_wider(
+            col = ends_with("_ci"),
+            names_sep = "_"
+        )
+    
+    bind_cols(les_estimations, les_ic) |> select(-data)
+}
+
+EE_nested <- EE_nested |> 
+    bind_cols(wass_fct(EE_nested$data, R=100))
+
+```
+
+
+Graphique 1 : Où l'on voit l'écart brut entre les enfants d'ouvrier et de cadres selon cette distance de Wasserstein.
+
+```{r}
+# Premier graphique des inégalités de destin
+ggplot(EE_nested, aes(x = AN11, y = AG10, fill = w_Cadre)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(w_Cadre, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0("[", round(boot_Cadre_ci_1, 3), ", ", round(boot_Cadre_ci_2, 3), "]")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~SEXE) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Indices de\nWasserstein") +
+    labs(
+        title = "Évolution de l'inégalité de destin (Distance de Wasserstein)",
+        subtitle = "Comparaison Origine Ouvrière vs Cadre sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+```
+
+Quelques constats : 
+Tout d'abord, on voit par exemple que pour les 50-60 ans, dans les années 1990, les enfants de cadres touchaient des salaires exp(0.62) = 1.85, soit 85% supérieurs à ceux des enfants d'ouvriers
+Le profil est assez semblable chez les hommes et les femmes.
+La distance augmente avec l'âge, mais elle diminue avec la période. Plus encore, la distance semble relativement stable pour une génération donnée. Elle diminue au fur et à mesure des générations
+
+Graphique 2 : Où l'on voit que les différences de forme des distributions jouent peu dans cette mesure des inégalités.
+```{r}
+EE_nested |>
+    mutate(
+        trans_sq = (m_Ouvrier - m_Cadre)^2, 
+        disp_sq = (sd_Ouvrier - sd_Cadre)^2,
+        total_sq = trans_sq + disp_sq,
+        part_translation = trans_sq / total_sq,
+        part_dispersion = disp_sq / total_sq
+    ) |>
+    pivot_longer(cols = c(part_translation, part_dispersion), 
+                 names_to = "Composante", values_to = "Valeur") |> 
+    ggplot(aes(x = AN11, y = Valeur, fill = Composante)) +
+    geom_bar(stat = "identity", position = "fill") +
+    facet_grid(SEXE ~ AG10) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = "Set1", labels = c("Dispersion (Forme)", "Translation (Moyenne)")) +
+    labs(title = "Décomposition de l'inégalité (W2) : Moyenne vs Dispersion",
+         y = "Part de la distance totale", x = "Période") +
+    theme_minimal()
+
+```
+
+Dans l'ensemble, les inégalités se traduisent ici essentiellement par une translation de la distribution des log salaires. Une des explications est que la focale porte ici sur tous les salariés et compare des individus de même sexe, âge et période. On verra plus loin la comparaison entre les sexes. Il faudrait élargir la focale en intégrant d'une part les revenus d'activités et d'autres part trouver un moyen d'intégrer le chômage.
+
+
+```{r}
+
+# Focus sur les inégalités dans la queue de distributions
+# Fonction pour calculer W2 sur une tranche de quantiles (ex: 0.90 à 1)
+Wasserstein_top <- function(a, b, q_min = 0.90, q_max = 1.0) {
+    a <- a[is.finite(a)]
+    b <- b[is.finite(b)]
+    if (length(a) < 10 | length(b) < 10) return(NA)
+    probs <- seq(q_min, q_max, length.out = 250)
+    qa <- quantile(a, probs, na.rm = TRUE)
+    qb <- quantile(b, probs, na.rm = TRUE)
+    
+    # Distance L2 entre les fonctions de quantiles sur cette plage
+    sqrt(mean((qa - qb)^2))
+}
+
+```
+
+Graphique 3 : où l'on voit que l'inégalité relative est plus forte du côté des hauts salaires.
+
+```{r}
+wass_curve <- reduce(seq(0, 95, by = 5), .f = \(df, q) {
+    df |> 
+        mutate("w_Cadre_{q}" := map_dbl(data, \(x) Wasserstein_top(
+            a = x |> filter(Origin == "Cadre") |> pull(logsal), 
+            b = x |> filter(Origin == "Ouvrier") |> pull(logsal),
+            q_min = q/100, q_max = (q+5)/100
+        )))
+}, .init = EE_nested) |> 
+    select(SEXE, AG10, AN11, starts_with("w_Cadre_")) |>
+    pivot_longer(
+        cols      = starts_with("w_Cadre_"),
+        names_to  = "quantile",
+        names_prefix = "w_Cadre_",
+        values_to = "w_Cadre"
+    ) |>
+    mutate(quantile = as.integer(quantile),
+           GEN = (as.integer(AN11) - as.integer(AG10)) * 10 + 1960,
+           GEN = factor(GEN))
+
+ggplot(wass_curve, aes(x = quantile, y = w_Cadre, col = GEN)) +
+    geom_line() +
+    facet_grid(AN11~SEXE)
+```
+Chez les hommes, les courbes sont clairement croissante, indiquant que l'inégalité passe d'un avantage relatif de .25 chez les moins bien payés à .75 chez les mieux payés. L'effet semble s'atténuer au cours des générations.
+Chez les femmes, l'effet est moins net, avec un profil plus plat. Pour les plus ancienens générations, dans les années 1990, le profil est même inverse et l'écart était surtout important entre les femmes des deux origines du côté des petits salaires (autrement dit, un petit salaire de fille de cadre était bien plus élevé qu'un petit salaire de fille d'ouvrier).
+
+```{r}
+# Prise en compte du Niveau de diplome
+# Fonction de transport optimal pour diplome7 - pour produire un contrefactuel de rendement égal.
+# fonction de mapping pour transporter une distribution d'une catégorie vers une autre
+quantile_map <- function(source_sal, target_sal) {
+    
+    percentiles <- ecdf(source_sal)(source_sal)
+    percentiles <- pmin(pmax(percentiles, 0.001), 0.999)
+    
+    quantile(target_sal, probs = percentiles, type = 7) |> as.numeric()
+}
+```
+
+
+```{r}
+# Principe : on transporte le logsal des origin Ouvrier par Niveau de diplome sur les autres origines, même diplome.
+# Ainsi on crée un contrefactuel où le rendement du Niveau de diplome n'est plus une explication des inégalités. 
+# Reste alors l'inégalité des chances liés à diplome
+EE_diplome <- EE_nested |> 
+    select(SEXE, AN11, AG10, data) |> 
+    unnest(cols = data) |> 
+    nest(data = -c(SEXE, AG10, AN11, dip7)) |> 
+    drop_na(dip7) |> 
+    filter(dip7 != "Non réponse")
+
+# construction du contrefactuel
+EE_diplome <- EE_diplome |> 
+    mutate(data = map(data, \(x) {
+        sal_ouvrier <- x |> filter(Origin == "Cadre") |> pull(logsal)
+        if(length(sal_ouvrier) == 0) return(x |> mutate(logsal_contrefactuel = logsal))
+        
+        mapping_table <- x |> 
+            filter(Origin != "Cadre") |> 
+            group_by(Origin) |> 
+            mutate(logsal_contrefactuel = quantile_map(logsal, sal_ouvrier)) |> 
+            ungroup() |> 
+            select(id, logsal_contrefactuel) 
+        
+        # 3. Fusionner le résultat avec le tibble d'origine
+        x |> 
+            left_join(mapping_table, by = "id") |> 
+            mutate(logsal_contrefactuel = coalesce(logsal_contrefactuel, logsal))
+    }))
+
+EE_diplome <- EE_diplome |> 
+    unnest(cols = data) |> 
+    nest(data = -c(SEXE, AN11, AG10))
+
+EE_diplome <- EE_diplome |> 
+    bind_cols(wass_fct(EE_diplome$data, var = "logsal_contrefactuel"))
+```
+
+graphique 4 : où l'on voit que les inégalités de salaires sont avant tout liées à l'inégalités d'accès aux différents niveaux de diplôme.
+```{r}
+# Deuxième graphique des inégalités de destin (hors rendement du Niveau de diplome)
+ggplot(EE_diplome, aes(x = AN11, y = AG10, fill = w_Cadre)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(w_Cadre, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0("[", round(boot_Cadre_ci_1, 3), ", ", round(boot_Cadre_ci_2, 3), "]")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~SEXE) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Indices de\nWasserstein") +
+    labs(
+        title = "Évolution de l'inégalité de destin hors rendement du diplome (Distance de Wasserstein)",
+        subtitle = "Comparaison Origine Ouvrière vs Cadre sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+
+```
+
+La méthode utilisée ici a consisté à égaliser les distributions de salaires entre les salariés d'origine sociale différente, dès lors qu'ils ont le même niveau de diplôme (à 7 niveaux ici). De cette manière, on écrase les effets de rendements différenciés des niveaux de diplômes selon l'origine (effet réseau, ambition différente) et les nuances au sein de chaque niveau entre les diplômes ou les spécialités. On en déduit un salaire contrefactuel qui permet de mesurer le "pur" effet de l'inégalité d'accès aux niveaux de diplômes selon l'origine.
+
+Le résultat montre un profil assez proche de celui sur les salaires réels. Il est en partie atténué. Avec toujours une réduction au fur et à mesure des générations.
+
+graphique 5 où l'on examine l'écart entre les graphiques sur le salaire réel et celui contrefactuel, donnant une idée du rendement du niveau de diplôme.
+
+```{r}
+EE_comp <- bind_rows(list(
+    réel = EE_nested |> select(-data),
+    contrefactuel = EE_diplome |> select(-data)),
+    .id = "cas"
+)
+
+EE_comp |> 
+    group_by(SEXE, AG10, AN11) |> 
+    summarise(delta_cadre = w_Cadre[cas == "réel"] - w_Cadre[cas == "contrefactuel"],
+              part_rendement = 100 * (w_Cadre[cas == "réel"]^2 - w_Cadre[cas == "contrefactuel"]^2) / w_Cadre[cas == "réel"]^2) |> 
+    ggplot(aes(x = AN11, y = AG10, fill = delta_cadre)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(delta_cadre, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0(round(part_rendement, 1), "%")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~SEXE) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Delta des indices\n de Wasserstein") +
+    labs(
+        title = "Évolution du rendement du niveau de diplome et poids relatif de ce facteur sur les inégalités",
+        subtitle = "Comparaison Origine Ouvrière vs Cadre sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+```
+IL s'agit de la mesure du rendement du niveau de diplome (7 cat). L'effet s'atténue au fur et à mesure des générations. Cet effet de rendement demeure une moyenne au sein de chaque niveau de diplôme. Aussi, on ne peut pas réellement démêler ce qui tient à des effets de rendements plus spécifiques (réseaux, etc.) et ce qui tient aux inégalités de diplôme à l'intérieur de chaque niveau, en termes de prestiges et de spécialisations. Bref la mesure reste liée au choix de catégorisation.
+
+
+On regarde maintenant les PCS à 1 chiffres des salariés, en construisant aussi un salaire contrefactuel (identité des profils de salaire pour une même pcs entre les individus d'origine sociale différente)
+
+```{r}
+# Introduction des PCS
+EE_pcs <- EE |> 
+    drop_na(CSTOT1) |> 
+    filter(CSTOT1 != "Artisans, commerçants, chefs d'entreprise") |> 
+    nest(data = -c(SEXE, AG10, AN11, CSTOT1))
+
+# construction du contrefactuel
+EE_pcs <- EE_pcs |> 
+    mutate(data = map(data, \(x) {
+        sal_ouvrier <- x |> filter(Origin == "Cadre") |> pull(logsal)
+        if(length(sal_ouvrier) == 0) return(x |> mutate(logsal_contrefactuel = logsal))
+        
+        mapping_table <- x |> 
+            filter(Origin != "Cadre") |> 
+            group_by(Origin) |> 
+            mutate(logsal_contrefactuel = quantile_map(logsal, sal_ouvrier)) |> 
+            ungroup() |> 
+            select(id, logsal_contrefactuel) 
+        
+        # 3. Fusionner le résultat avec le tibble d'origine
+        x |> 
+            left_join(mapping_table, by = "id") |> 
+            mutate(logsal_contrefactuel = coalesce(logsal_contrefactuel, logsal))
+    }))
+
+EE_pcs <- EE_pcs |> 
+    unnest(cols = data) |> 
+    nest(data = -c(SEXE, AN11, AG10))
+
+EE_pcs <- EE_pcs |> 
+    bind_cols(wass_fct(EE_pcs$data, var = "logsal_contrefactuel"))
+```
+
+
+```{r}
+ggplot(EE_pcs, aes(x = AN11, y = AG10, fill = w_Cadre)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(w_Cadre, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0("[", round(boot_Cadre_ci_1, 3), ", ", round(boot_Cadre_ci_2, 3), "]")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~SEXE) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Indices de\nWasserstein") +
+    labs(
+        title = "Évolution de l'inégalité de destin hors rendement PCS1 (Distance de Wasserstein)",
+        subtitle = "Comparaison Origine Ouvrière vs Cadre sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+```
+
+même profil. Il s'agit de la mesure de l'inégalité salariale résultant de l'inégalité des chances de destination (PCS 1 chiffre), sans tenir compte de différences salariales entre origine ayant la même destinée. Cet indicateur semble relativement constant par génération et diminue un peu plus à chaque génération. Cette inégalité est plus prononcée chez les hommes.  
+
+
+```{r}
+EE_comp2 <- bind_rows(list(
+    réel = EE_nested |> select(-data),
+    contrefactuel = EE_pcs |> select(-data)),
+    .id = "cas"
+)
+
+EE_comp2 |> 
+    group_by(SEXE, AG10, AN11) |> 
+    summarise(delta_cadre = w_Cadre[cas == "réel"] - w_Cadre[cas == "contrefactuel"],
+              part_rendement = 100 * (w_Cadre[cas == "réel"]^2 - w_Cadre[cas == "contrefactuel"]^2) / w_Cadre[cas == "réel"]^2) |> 
+    ggplot(aes(x = AN11, y = AG10, fill = delta_cadre)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(delta_cadre, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0(round(part_rendement, 1), "%")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~SEXE) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Delta des indices\n de Wasserstein") +
+    labs(
+        title = "Évolution du rendement de la pcs et poids relatif de ce facteur sur les inégalités",
+        subtitle = "Comparaison Origine Ouvrière vs Cadre sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+```
+
+Ici les différences de rendements du niveau 1 de PCS ou résultant d'une pcs plus fine sont faibles, notamment chez les hommes. L'effet est prononcé du côté des femmes dans les anciennes générations dans les années 90, et tend ensuite à baisser. Dans l'ensemble, l'origine joue sur la transmission d'une pcs 1c, mais relativement peu ensuite.
+
+
+
+Autre regard : on examine maintenant à l'intérieur de chaque origine comment les destins salariaux divergent entre les hommes et les femmes. 
+```{r}
+EE_sexe <- EE |> 
+    nest(data = -c(AN11, AG10, Origin))
+
+# Fonctions pour comparaison SEXE
+wass_boot_sex <- function(data, indices, var = "logsal") {
+    d <- data[indices, ]
+    x <- d |> filter(SEXE == "Homme") |> pull(.data[[var]])
+    y <- d |> filter(SEXE == "Femme") |> pull(.data[[var]])
+    if (length(x) < 2 | length(y) < 2) return(NA)
+    wasserstein1d(x, y, p = 2)
+}
+
+wass_fct_sex <- function(df_list, var = "logsal", R = 100) {
+    
+    les_estimations <- tibble(data = df_list) |> 
+        mutate(
+            w_femme  = map_dbl(data, \(x) wasserstein1d(
+                a = x |> filter(SEXE == "Homme") |> pull(.data[[var]]), 
+                b = x |> filter(SEXE == "Femme") |> pull(.data[[var]]), p = 2)),
+            m_femme = map_dbl(data, \(x) mean(x[[var]][x$SEXE == "Femme"], na.rm = TRUE)),
+            sd_femme = map_dbl(data, \(x) sd(x[[var]][x$SEXE == "Femme"], na.rm = TRUE)),
+            m_homme  = map_dbl(data, \(x) mean(x[[var]][x$SEXE == "Homme"], na.rm = TRUE)),
+            sd_homme = map_dbl(data, \(x) sd(x[[var]][x$SEXE == "Homme"],  na.rm = TRUE))
+        )
+    
+    les_boots <- tibble(data = df_list) |> 
+        mutate(
+            boot_sex = map(data, \(x) boot(
+                data = x, 
+                statistic = \(d, i) wass_boot_sex(d, i, var = var), 
+                R = R))
+            )
+    
+    les_ic <- les_boots |> 
+        transmute(boot_ci = map(boot_sex, \(x) boot.ci(x, type = "perc")$percent[4:5])) |> 
+        unnest_wider(
+            col = boot_ci,
+            names_sep = "_"
+        )
+    
+    bind_cols(les_estimations, les_ic) |> select(-data)
+}
+
+EE_sexe <- EE_sexe |> 
+    bind_cols(wass_fct_sex(EE_sexe$data, R=100))
+
+
+```
+
+
+```{r}
+ggplot(EE_sexe, aes(x = AN11, y = AG10, fill = w_femme)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(w_femme, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0("[", round(boot_ci_1, 3), ", ", round(boot_ci_2, 3), "]")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~Origin) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Indices de\nWasserstein") +
+    labs(
+        title = "Évolution de l'inégalité de genre selon l'origine (Distance de Wasserstein)",
+        subtitle = "Comparaison Femme vs Homme sur le log du salaire",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+
+
+```
+L'inégalité homme femme est assez forte, diminue pour les générations les plus récentes.
+
+```{r}
+EE_sexe |>
+    mutate(
+        trans_sq = (m_homme - m_femme)^2, 
+        disp_sq = (sd_homme - sd_femme)^2,
+        total_sq = trans_sq + disp_sq,
+        part_translation = trans_sq / total_sq,
+        part_dispersion = disp_sq / total_sq
+    ) |>
+    pivot_longer(cols = c(part_translation, part_dispersion), 
+                 names_to = "Composante", values_to = "Valeur") |> 
+    ggplot(aes(x = AG10, y = Valeur, fill = Composante)) +
+    geom_bar(stat = "identity", position = "fill") +
+    facet_grid(Origin ~ AN11) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = "Set1", labels = c("Dispersion (Forme)", "Translation (Moyenne)")) +
+    labs(title = "Décomposition de l'inégalité (W2) : Moyenne vs Dispersion",
+         y = "Part de la distance totale", x = "Période") +
+    theme_minimal()
+```
+
+Ces inégalités sont d'abord un effet de translation, mais aussi un peu des écarts de dispersion de salaires, surtout dans les années 1990.
+
+
+Vérification du rôle du temps partiel
+```{r}
+# Construire un contrefactuel en équivalent temps plein
+EE_sexe_tp <- EE_sexe |> 
+    select(AN11, AG10, Origin, data)
+
+EE_sexe_tp <- EE_sexe_tp |> 
+    mutate(data = map(data, \(x) {
+        sal_tempscomplet <- x |> filter(TP == "Temps complet") |> pull(logsal)
+        if(length(sal_tempscomplet) == 0) return(x |> mutate(logsal_contrefactuel = logsal))
+        
+        mapping_table <- x |> 
+            filter(TP != "Temps complet") |> 
+            group_by(TP) |> 
+            mutate(logsal_contrefactuel = quantile_map(logsal, sal_tempscomplet)) |> 
+            ungroup() |> 
+            select(id, logsal_contrefactuel) 
+        
+        # 3. Fusionner le résultat avec le tibble d'origine
+        x |> 
+            left_join(mapping_table, by = "id") |> 
+            mutate(logsal_contrefactuel = coalesce(logsal_contrefactuel, logsal))
+    }))
+
+EE_sexe_tp <- EE_sexe_tp |> 
+    unnest(cols = data) |> 
+    nest(data = -c(AN11, AG10, Origin))
+
+# résultat en équivalent temps plein
+EE_sexe_tp <- EE_sexe_tp |> 
+    bind_cols(wass_fct_sex(EE_sexe_tp$data, var = "logsal_contrefactuel"))
+
+```
+
+
+```{r}
+ggplot(EE_sexe_tp, aes(x = AN11, y = AG10, fill = w_femme)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = round(w_femme, 2)), color = "white", fontface = "bold") +
+    geom_text(aes(label = paste0("[", round(boot_ci_1, 3), ", ", round(boot_ci_2, 3), "]")), 
+              color = "white", size = 2.8, vjust = 2.5) +
+    facet_wrap(~Origin) +
+    scale_fill_viridis(option = "viridis", direction = -1, name = "Indices de\nWasserstein") +
+    labs(
+        title = "Évolution de l'inégalité de genre selon l'origine (Distance de Wasserstein)",
+        subtitle = "Comparaison Femme vs Homme sur le log du salaire en eq temps complet",
+        x = "Période",
+        y = "Tranche d'âge",
+        caption = "Source : Enquête Emploi"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text = element_text(color = "black")
+    )
+```
+Une assez nette réduction des inégalités, ce qui montre que le temps partiel contribue fortement aux écarts selon l'origine.
+
