@@ -193,6 +193,8 @@ EE_nested |>
          OR = tx_chom_ouv * (1 - tx_chom_cad) / tx_chom_cad / (1 - tx_chom_ouv))
 
 
+ # les valeurs manquantes ne sont pas aléatoires.
+ 
  
  df_reg <- EE_nested |> 
      mutate(
